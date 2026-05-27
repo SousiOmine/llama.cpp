@@ -1766,6 +1766,82 @@ class TextModel(ModelBase):
         special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
         special_vocab.add_to_gguf(self.gguf_writer)
 
+    def _set_vocab_hf_unigram(self):
+        tokenizer_path = self.dir_model / "tokenizer.json"
+        with open(tokenizer_path, "r", encoding="utf-8") as f:
+            tokenizer_json = json.load(f)
+
+        tokenizer_model = tokenizer_json["model"]
+        if tokenizer_model["type"] != "Unigram":
+            raise FileNotFoundError("Cannot find Hugging Face Unigram tokenizer")
+
+        vocab_json = tokenizer_model["vocab"]
+        vocab_size = self.find_hparam([
+            "vocab_size_per_layer_input", # gemma3n
+            "vocab_size",
+        ], optional=True) or len(vocab_json)
+
+        tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
+        scores: list[float] = [-10000.0] * vocab_size
+        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
+
+        special_ids = {
+            int(token["id"])
+            for token in tokenizer_json.get("added_tokens", [])
+            if token.get("special")
+        }
+        user_defined_ids = {
+            int(token["id"])
+            for token in tokenizer_json.get("added_tokens", [])
+            if not token.get("special")
+        }
+        unk_id = tokenizer_model.get("unk_id")
+
+        for token_id, (piece, score) in enumerate(vocab_json):
+            if token_id >= vocab_size:
+                logger.warning(f'ignore tokens from {token_id}: id is out of range, max={vocab_size - 1}')
+                break
+
+            toktype = SentencePieceTokenTypes.NORMAL
+            if token_id == unk_id:
+                toktype = SentencePieceTokenTypes.UNKNOWN
+            elif token_id in special_ids or self.does_token_look_special(piece):
+                toktype = SentencePieceTokenTypes.CONTROL
+            elif token_id in user_defined_ids:
+                toktype = SentencePieceTokenTypes.USER_DEFINED
+            elif tokenizer_model.get("byte_fallback", False) and re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", piece):
+                toktype = SentencePieceTokenTypes.BYTE
+
+            tokens[token_id] = piece.encode("utf-8")
+            scores[token_id] = float(score)
+            toktypes[token_id] = toktype
+
+        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
+        if tokenizer_config_file.is_file():
+            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
+                tokenizer_config_json = json.load(f)
+                added_tokens_decoder = tokenizer_config_json.get("added_tokens_decoder", {})
+                for token_id, token_data in added_tokens_decoder.items():
+                    token_id = int(token_id)
+                    token: str = token_data["content"]
+                    if token_id >= vocab_size:
+                        logger.warning(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
+                        continue
+                    if token_data.get("special") or self.does_token_look_special(token):
+                        toktypes[token_id] = SentencePieceTokenTypes.CONTROL
+                    elif toktypes[token_id] == SentencePieceTokenTypes.UNUSED:
+                        toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
+                    tokens[token_id] = token.encode("utf-8")
+
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
     def _create_vocab_sentencepiece(self):
         from sentencepiece import SentencePieceProcessor
 

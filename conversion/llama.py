@@ -60,6 +60,12 @@ class LlamaModel(TextModel):
                 if tokenizer_config_json.get("tokenizer_class") == "HybridDNATokenizer":
                     return self._set_vocab_hybriddna()
 
+        if path_tokenizer_json.is_file():
+            with open(path_tokenizer_json, "r", encoding="utf-8") as f:
+                tokenizer_json = json.load(f)
+                if tokenizer_json["model"]["type"] == "Unigram":
+                    return self._set_vocab_hf_unigram()
+
         try:
             self._set_vocab_sentencepiece()
         except FileNotFoundError:
